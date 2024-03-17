@@ -62,6 +62,15 @@ class MP4Remuxer extends EventEmitter {
     this._tracks = []
     this._hasVideo = false
     this._hasAudio = false
+
+    console.log(traks);
+
+    var hevc = Object.assign(Object.create(null), {'hvc1': 1, 'hev1': 1});
+    var mp3a = Object.assign(Object.create(null), {'mp4a.6b': 1, 'mp4a.69': 1});
+    var vide = Object.assign(Object.create(null), {'avc1': 1, 'av01': 1, 'vp09': 1}, hevc);
+    var swap = Object.assign(Object.create(null), {'fLaC': 'flac', 'Opus': 'opus', '.mp3': 'mp3'});
+
+
     for (let i = 0; i < traks.length; i++) {
       const trak = traks[i]
       const stbl = trak.mdia.minf.stbl
@@ -69,26 +78,61 @@ class MP4Remuxer extends EventEmitter {
       const handlerType = trak.mdia.hdlr.handlerType
       let codec
       let mime
-      if (handlerType === 'vide' && stsdEntry.type === 'avc1') {
+
+      console.log(stsdEntry);
+
+      if (handlerType === 'vide' && vide[stsdEntry.type]) {
         if (this._hasVideo) {
           continue
         }
         this._hasVideo = true
-        codec = 'avc1'
+
+
+        codec = stsdEntry.type;
         if (stsdEntry.avcC) {
-          codec += `.${stsdEntry.avcC.mimeCodec}`
+            codec += '.' + stsdEntry.avcC.mimeCodec
         }
-        mime = `video/mp4; codecs="${codec}"`
-      } else if (handlerType === 'soun' && stsdEntry.type === 'mp4a') {
+        else if (stsdEntry.av1C) {
+            codec = stsdEntry.av1C.mimeCodec || codec;
+        }
+        else if (stsdEntry.vpcC) {
+            codec = stsdEntry.vpcC.mimeCodec || codec;
+        }
+        else if (stsdEntry.hvcC) {
+            codec += stsdEntry.hvcC.mimeCodec;
+        }
+
+        mime = 'video/mp4; codecs="' + codec + '"';
+
+        console.log(mime);
+
+      } else if (handlerType === 'soun' ) {
         if (this._hasAudio) {
           continue
         }
         this._hasAudio = true
-        codec = 'mp4a'
-        if (stsdEntry.esds && stsdEntry.esds.mimeCodec) {
-          codec += `.${stsdEntry.esds.mimeCodec}`
+
+
+        codec = stsdEntry.type;
+
+        if (stsdEntry.type === 'mp4a') {
+            codec = 'mp4a';
+
+            if (stsdEntry.esds && stsdEntry.esds.mimeCodec) {
+                codec += '.' + stsdEntry.esds.mimeCodec
+            }
+
+            // if (mp3a[codec]) {
+            //     // Firefox allows mp3 in mp4 this way
+            //     codec = 'mp3'
+            // }
         }
-        mime = `audio/mp4; codecs="${codec}"`
+
+        mime = 'audio/mp4; codecs="' + (swap[codec] || codec) + '"';
+
+        console.log(mime);
+
+        
       } else {
         continue
       }
@@ -474,3 +518,347 @@ function empty () {
 const MIN_FRAGMENT_DURATION = 1 // second
 
 module.exports = MP4Remuxer
+
+
+
+
+
+
+// Extending mp4-box-encoding boxes support...
+
+var UINT32_MAX = Math.pow(2, 32);
+
+Box.boxes.fullBoxes.co64 = true;
+Box.boxes.co64 = Box.boxes.co64 || {};
+Box.boxes.co64.decode = function(buf, offset) {
+    buf = buf.slice(offset);
+    var num = buf.readUInt32BE(0);
+    var entries = new Array(num);
+
+    for (var i = 0; i < num; i++) {
+        var pos = i * 8 + 4;
+        var hi = buf.readUInt32BE(pos);
+        var lo = buf.readUInt32BE(pos + 4);
+        entries[i] = (hi * UINT32_MAX) + lo;
+    }
+
+    return {
+        entries: entries
+    }
+};
+
+Box.boxes.av1C = {};
+Box.boxes.av1C.encode = function _(box, buf, offset) {
+    buf = buf ? buf.slice(offset) : Buffer.allocUnsafe(box.buffer.length);
+    box.buffer.copy(buf);
+    _.bytes = box.buffer.length;
+};
+Box.boxes.av1C.decode = function (buf, offset, end) {
+    // https://aomediacodec.github.io/av1-isobmff/#codecsparam
+    var p = 0;
+    var r = Object.create(null);
+    var readUint8 = function() {
+        return buf.readUInt8(p++);
+    };
+    buf = buf.slice(offset, end);
+
+    var tmp = readUint8();
+    this.version = tmp & 0x7F;
+
+    if ((tmp >> 7) & 1 !== 1) {
+        console.warn('Invalid av1C marker.');
+    }
+    else if (this.version !== 1) {
+        console.warn('Unsupported av1C version %d.', this.version);
+    }
+    else {
+        tmp = readUint8();
+        r.seq_profile = (tmp >> 5) & 7;
+        r.seq_level_idx_0 = tmp & 0x1f;
+        tmp = readUint8();
+        r.seq_tier_0 = (tmp >> 7) & 1;
+        r.high_bitdepth = (tmp >> 6) & 1;
+        r.twelve_bit = (tmp >> 5) & 1;
+        r.monochrome = (tmp >> 4) & 1;
+        r.chroma_subsampling_x = (tmp >> 3) & 1;
+        r.chroma_subsampling_y = (tmp >> 2) & 1;
+        r.chroma_sample_position = (tmp & 3);
+        tmp = readUint8();
+        r.reserved = (tmp >> 5) & 7;
+        r.buffer = Buffer.from(buf);
+        tmp = r.high_bitdepth;
+        if (tmp < 10) tmp = 8;
+        r.mimeCodec = [
+            'av01',
+            r.seq_profile,
+            ('0' + r.seq_level_idx_0).slice(-2) + (!r.seq_tier_0 ? 'M' : 'H'),
+            ('0' + tmp).slice(-2)
+        ].join('.');
+    }
+    return r;
+};
+Box.boxes.av1C.encodingLength = function (box) {
+    return box.buffer.length;
+};
+Box.boxes.av01 = Box.boxes.VisualSampleEntry;
+
+Box.boxes.vpcC = {};
+Box.boxes.vpcC.encode = function _(box, buf, offset) {
+    buf = buf ? buf.slice(offset) : Buffer.allocUnsafe(box.buffer.length);
+    box.buffer.copy(buf);
+    _.bytes = box.buffer.length;
+};
+Box.boxes.vpcC.decode = function(buf, offset, end) {
+    // https://www.webmproject.org/vp9/mp4/
+    var p = 0;
+    var r = Object.create(null);
+    var readUint8 = function() {
+        return buf.readUInt8(p++);
+    };
+    var readUint8Array = function(len) {
+        var out = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+            out[i] = readUint8();
+        }
+        return out;
+    };
+    var readUint16 = function() {
+        var v = buf.readUInt16BE(p);
+        p += 2;
+        return v;
+    };
+    buf = buf.slice(offset, end);
+
+    var tmp = readUint8();
+    this.version = tmp & 0x7F;
+
+    if (this.version !== 1) {
+        console.warn('Unsupported/deprecated vpcC version %d.', this.version);
+    }
+    else {
+        p += 3; // XXX: out of spec, find it out..
+        r.profile = readUint8();
+        r.level = readUint8();
+        tmp = readUint8();
+        r.bitDepth = tmp >> 4;
+        r.chromaSubsampling = (tmp >> 1) & 7;
+        r.videoFullRangeFlag = tmp & 1;
+        // r.colourPrimaries = readUint8();
+        // r.transferCharacteristics = readUint8();
+        // r.matrixCoefficients = readUint8();
+        // r.codecIntializationDataSize = readUint16();
+        // r.codecIntializationData = readUint8Array(r.codecIntializationDataSize);
+        r.buffer = Buffer.from(buf);
+        r.mimeCodec = [
+            'vp09',
+            ('0' + r.profile).slice(-2),
+            ('0' + r.level).slice(-2),
+            ('0' + r.bitDepth).slice(-2)
+        ].join('.');
+    }
+    return r;
+};
+Box.boxes.vpcC.encodingLength = function(box) {
+    return box.buffer.length;
+};
+Box.boxes.vp09 = Box.boxes.VisualSampleEntry;
+
+Box.boxes.hvcC = {};
+Box.boxes.hvcC.encode = function _(box, buf, offset) {
+    buf = buf ? buf.slice(offset) : Buffer.allocUnsafe(box.buffer.length);
+    box.buffer.copy(buf);
+    _.bytes = box.buffer.length;
+};
+Box.boxes.hvcC.decode = function(buf, offset, end) {
+    // https://www.iso.org/standard/65216.html
+    var p = 0;
+    var r = Object.create(null);
+    var readUint8 = function() {
+        return buf.readUInt8(p++);
+    };
+    var readUint8Array = function(len) {
+        var out = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+            out[i] = readUint8();
+        }
+        return out;
+    };
+    var readUint16 = function() {
+        var v = buf.readUInt16BE(p);
+        p += 2;
+        return v;
+    };
+    var readUint32 = function() {
+        var v = buf.readUInt32BE(p);
+        p += 4;
+        return v;
+    };
+    buf = buf.slice(offset, end);
+
+    var tmp = readUint8();
+    this.version = tmp & 0xFF;
+    r.configurationVersion = this.version;
+
+    tmp = readUint8();
+    r.profile_space = tmp >> 6;
+    r.tier_flag = (tmp & 32) >> 5;
+    r.profile_idc = (tmp & 0x1f);
+    r.profile_compatibility_indications = readUint32();
+    r.constraint_indicator_flags = readUint8Array(6);
+    r.level_idc = readUint8();
+    r.min_spatial_segmentation_idc = readUint16() & 0xfff;
+    r.parallelismType = (readUint8() & 3);
+    r.chromaFormat = (readUint8() & 3);
+    r.bitDepthLumaMinus8 = (readUint8() & 7);
+    r.bitDepthChromaMinus8 = (readUint8() & 7);
+    r.avgFrameRate = readUint16();
+
+    tmp = readUint8();
+    r.constantFrameRate = (tmp >> 6);
+    r.numTemporalLayers = (tmp & 13) >> 3;
+    r.temporalIdNested = (tmp & 4) >> 2;
+    r.lengthSizeMinusOne = (tmp & 3);
+    r.buffer = Buffer.from(buf);
+
+    // e.g. 'hvc1.1.6.L93.90';
+    var mime = '.';
+    if (r.profile_space) {
+        mime += String.fromCharCode(64 + r.profile_space);
+    }
+    mime += r.profile_idc + '.';
+
+    tmp = 0;
+    var j = 0, cpl = r.profile_compatibility_indications;
+    while (true) {
+        tmp = cpl & 1;
+        if (++j > 30) {
+            break;
+        }
+        tmp <<= 1;
+        cpl >>= 1;
+    }
+    mime += tmp.toString(16) + '.' + (r.tier_flag ? 'H' : 'L') + r.level_idc;
+
+    tmp = '';
+    cpl = r.constraint_indicator_flags;
+    for (j = 5; j >= 0; j--) {
+        if (cpl[j] || tmp) {
+            tmp = '.' + ('0' + Number(cpl[j]).toString(16)).slice(-2) + tmp;
+        }
+    }
+    r.mimeCodec = mime + tmp;
+    return r;
+};
+Box.boxes.hvcC.encodingLength = function(box) {
+    return box.buffer.length;
+};
+Box.boxes.hev1 = Box.boxes.VisualSampleEntry;
+Box.boxes.hvc1 = Box.boxes.VisualSampleEntry;
+
+Box.boxes.fullBoxes.sidx = true;
+Box.boxes.sidx = {};
+Box.boxes.sidx.decode = function(buf, offset) {
+    var r = Object.create(null);
+    var p = offset + 4, time;
+
+    var readUInt16 = function() {
+        var v = buf.readUInt16BE(p);
+        p += 2;
+        return v;
+    };
+    var readUInt32 = function() {
+        var v = buf.readUInt32BE(p);
+        p += 4;
+        return v;
+    };
+    var readUInt64 = function() {
+        var hi = readUInt32();
+        var lo = readUInt32();
+        return (hi * UINT32_MAX) + lo;
+    };
+
+    r.referenceId = readUInt32();
+    r.timescale = readUInt32();
+
+    if (this.version === 0) {
+        r.earliestPresentationTime = readUInt32();
+        r.firstOffset = readUInt32();
+    }
+    else {
+        r.earliestPresentationTime = readUInt64();
+        r.firstOffset = readUInt64();
+    }
+
+    readUInt16(); // skip reserved
+    r.count = readUInt16();
+    r.entries = new Array(r.count);
+
+    time = r.earliestPresentationTime;
+    offset = this.length + r.firstOffset;
+
+    for (var i = 0; i < r.count; i++) {
+        var e = r.entries[i] = Object.create(null);
+        var t = readUInt32();
+        e.type = (t >>> 31) & 1;
+        e.size = t & 0x7fffffff;
+        e.duration = readUInt32();
+
+        t = readUInt32();
+        e.sap = (t >>> 31) & 1;
+        e.sapType = (t >>> 28) & 0x7;
+        e.sapDelta = t & 0xfffffff;
+
+        // for an exact byte-offset on disk we need to add the size for ftyp+moov
+        e.byteOffset = [offset, offset + e.size - 1];
+        e.timeOffset = [time, time / r.timescale, e.duration / r.timescale];
+
+        offset += e.size;
+        time += e.duration;
+    }
+
+    return r;
+};
+
+Box.boxes.AudioSampleEntry.decode = function(buf, offset, end) {
+    buf = buf.slice(offset, end);
+    var length = end - offset;
+    var box = {
+        dataReferenceIndex: buf.readUInt16BE(6),
+        channelCount: buf.readUInt16BE(16),
+        sampleSize: buf.readUInt16BE(18),
+        sampleRate: buf.readUInt32BE(24),
+        children: []
+    };
+
+    var ptr = 28;
+    while (length - ptr >= 8) {
+        var child = Box.decode(buf, ptr, length);
+        if (!child.length) break; // BUGFIX: prevent endless loop with QT videos - FIXME
+        box.children.push(child);
+        box[child.type] = child;
+        ptr += child.length;
+    }
+
+    return box
+};
+
+Box.boxes.stsz.decode = function(buf, offset) {
+    buf = buf.slice(offset)
+    var size = buf.readUInt32BE(0)
+    var num = buf.readUInt32BE(4)
+    var entries = []
+
+    if (size === 0) {
+        entries = new Array(num)
+
+        for (var i = 0; i < num; i++) {
+            entries[i] = buf.readUInt32BE(i * 4 + 8)
+        }
+    }
+
+    return {
+        sample_size: size,
+        sample_count: num,
+        entries: entries
+    }
+};
